@@ -1,0 +1,61 @@
+name: Market Risk Monitor
+
+on:
+  schedule:
+    - cron: "0 21 * * *"  # 매일 오전 6시 (한국시간) 실행
+  workflow_dispatch:      # 수동 실행 버튼
+
+jobs:
+  check_indicators:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v3
+
+      - name: Python 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: 필요한 라이브러리 설치
+        run: |
+          pip install requests pandas
+
+      - name: 위험지표 점검 실행
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python3 << 'EOF'
+          import requests, pandas as pd, datetime, os
+
+          # 환경변수 불러오기
+          TOKEN = os.environ["TELEGRAM_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+          FRED_KEY = os.environ["FRED_API_KEY"]
+
+          def send_telegram(msg):
+              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+              requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+
+          # === FRED: 10Y-2Y 수익률 곡선 ===
+          url_yield = f"https://api.stlouisfed.org/fred/series/observations?series_id=T10Y2Y&api_key={FRED_KEY}&file_type=json"
+          data_yield = requests.get(url_yield).json()["observations"]
+          last_yield = float(data_yield[-1]["value"])
+
+          # 임계치
+          alert = []
+
+          # 수익률 곡선 경고 조건
+          if last_yield < 0.1:
+              alert.append(f"⚠ 수익률곡선 경고: {last_yield}%")
+
+          # 추후 다른 지표들 추가 예정 (OAS, 마진부채 등)
+
+          if alert:
+              msg = "📉 시장 위험 신호 발생!\n" + "\n".join(alert)
+              send_telegram(msg)
+
+          EOF
