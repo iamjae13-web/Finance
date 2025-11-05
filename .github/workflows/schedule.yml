@@ -1,61 +1,336 @@
-name: Market Risk Monitor
+name: Market Risk Monitor with Charts
 
 on:
   schedule:
-    - cron: "0 21 * * *"  # 매일 오전 6시 (한국시간) 실행
-  workflow_dispatch:      # 수동 실행 버튼
+    - cron: "0 21 * * *"  # 매일 21:00 UTC (한국시간 다음날 06:00). 필요시 수정
+  workflow_dispatch:
 
 jobs:
-  check_indicators:
+  monitor:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 저장소 체크아웃
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Python 설치
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: 필요한 라이브러리 설치
+      - name: Install dependencies
         run: |
-          pip install requests pandas
+          python -m pip install --upgrade pip
+          pip install requests pandas openpyxl beautifulsoup4 lxml matplotlib
 
-      - name: 위험지표 점검 실행
+      - name: Run monitor (with charts)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          FINRA_PAGE_URL: ${{ secrets.FINRA_PAGE_URL }}        # 선택, 기본 FINRA 마진 페이지 사용 가능
+          BUFFET_CSV_URL: ${{ secrets.BUFFET_CSV_URL }}        # 선택
+          HY_OAS_THRESHOLD: ${{ secrets.HY_OAS_THRESHOLD }}    # 선택 (기본 400)
+          MARGIN_THRESHOLD: ${{ secrets.MARGIN_THRESHOLD }}    # 선택 (기본 1e12)
+          BUFFET_THRESHOLD: ${{ secrets.BUFFET_THRESHOLD }}    # 선택 (기본 200)
         run: |
-          python3 << 'EOF'
-          import requests, pandas as pd, datetime, os
+          python3 - <<'PYCODE'
+          import os, requests, io, re
+          import pandas as pd
+          import matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
+          from datetime import datetime
+          from bs4 import BeautifulSoup
 
           # 환경변수 불러오기
-          TOKEN = os.environ["TELEGRAM_TOKEN"]
-          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-          FRED_KEY = os.environ["FRED_API_KEY"]
+          TOKEN = os.getenv("TELEGRAM_TOKEN")
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+          FRED_KEY = os.getenv("FRED_API_KEY")
+          FINRA_PAGE_URL = os.getenv("FINRA_PAGE_URL") or "https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics"
+          BUFFET_CSV_URL = os.getenv("BUFFET_CSV_URL")
 
-          def send_telegram(msg):
+          try:
+              HY_OAS_THRESHOLD = float(os.getenv("HY_OAS_THRESHOLD", "400"))
+          except:
+              HY_OAS_THRESHOLD = 400.0
+          try:
+              MARGIN_THRESHOLD = float(os.getenv("MARGIN_THRESHOLD", str(1.0e12)))
+          except:
+              MARGIN_THRESHOLD = 1.0e12
+          try:
+              BUFFET_THRESHOLD = float(os.getenv("BUFFET_THRESHOLD", "200"))
+          except:
+              BUFFET_THRESHOLD = 200.0
+
+          now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+          # ---------- 유틸: 텔레그램 전송 ----------
+          def telegram_send_text(text):
+              if not TOKEN or not CHAT_ID:
+                  print("텔레그램 설정 없음.")
+                  return False
               url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-              requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+              try:
+                  r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
+                  print("telegram text status", r.status_code)
+                  return r.status_code == 200
+              except Exception as e:
+                  print("telegram_send_text error:", e)
+                  return False
 
-          # === FRED: 10Y-2Y 수익률 곡선 ===
-          url_yield = f"https://api.stlouisfed.org/fred/series/observations?series_id=T10Y2Y&api_key={FRED_KEY}&file_type=json"
-          data_yield = requests.get(url_yield).json()["observations"]
-          last_yield = float(data_yield[-1]["value"])
+          def telegram_send_photo(photo_path, caption=None):
+              if not TOKEN or not CHAT_ID:
+                  print("텔레그램 설정 없음.")
+                  return False
+              url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+              try:
+                  with open(photo_path, "rb") as f:
+                      files = {"photo": f}
+                      data = {"chat_id": CHAT_ID}
+                      if caption:
+                          data["caption"] = caption
+                      r = requests.post(url, data=data, files=files, timeout=30)
+                      print("telegram photo status", r.status_code, r.text[:200])
+                      return r.status_code == 200
+              except Exception as e:
+                  print("telegram_send_photo error:", e)
+                  return False
 
-          # 임계치
-          alert = []
+          # ---------- FRED helper (단일 최신 관측 및 시계열) ----------
+          def fred_latest(series_id):
+              base = "https://api.stlouisfed.org/fred/series/observations"
+              params = {"series_id": series_id, "api_key": FRED_KEY, "file_type": "json", "limit": 1, "sort_order": "desc"}
+              try:
+                  r = requests.get(base, params=params, timeout=20); r.raise_for_status()
+                  j = r.json().get("observations", [])
+                  if not j: return None
+                  v = j[0].get("value")
+                  if v in (".", "", None): return None
+                  return float(v)
+              except Exception as e:
+                  print("fred_latest error", series_id, e)
+                  return None
 
-          # 수익률 곡선 경고 조건
-          if last_yield < 0.1:
-              alert.append(f"⚠ 수익률곡선 경고: {last_yield}%")
+          def fred_series(series_id, limit=120):
+              base = "https://api.stlouisfed.org/fred/series/observations"
+              params = {"series_id": series_id, "api_key": FRED_KEY, "file_type": "json", "limit": limit, "sort_order": "desc"}
+              try:
+                  r = requests.get(base, params=params, timeout=30); r.raise_for_status()
+                  obs = r.json().get("observations", [])
+                  vals = [(o.get("date"), o.get("value")) for o in obs if o.get("value") not in (".", "", None)]
+                  if not vals: return []
+                  # chronological order
+                  vals = vals[::-1]
+                  dates = [d for d,v in vals]
+                  values = [float(v) for d,v in vals]
+                  return dates, values
+              except Exception as e:
+                  print("fred_series error", series_id, e)
+                  return [], []
 
-          # 추후 다른 지표들 추가 예정 (OAS, 마진부채 등)
+          # ---------- FINRA 마진부채 추출 (페이지에서 엑셀 링크 찾아 파싱) ----------
+          def fetch_finra_margin_from_page(page_url):
+              try:
+                  r = requests.get(page_url, timeout=20); r.raise_for_status()
+              except Exception as e:
+                  print("FINRA page fetch error:", e)
+                  return None
+              soup = BeautifulSoup(r.text, "lxml")
+              links = []
+              for a in soup.find_all("a", href=True):
+                  href = a["href"]
+                  if re.search(r'\.xls[x]?$', href, re.IGNORECASE):
+                      links.append(href if href.startswith("http") else requests.compat.urljoin(page_url, href))
+              if not links:
+                  print("FINRA: 엑셀 링크 미발견.")
+                  return None
+              for link in links:
+                  try:
+                      rr = requests.get(link, timeout=30); rr.raise_for_status()
+                      xls = pd.read_excel(io.BytesIO(rr.content), sheet_name=0, header=None)
+                      df = xls.fillna("")
+                      found = []
+                      for r_i in range(max(0, df.shape[0]-20), df.shape[0]):
+                          row = df.iloc[r_i]
+                          for cell in row:
+                              s = str(cell)
+                              if re.search(r'[\d\$,]{3,}', s):
+                                  s2 = re.sub(r'[^0-9.\-]', '', s)
+                                  try:
+                                      val = float(s2)
+                                      found.append(val)
+                                  except:
+                                      continue
+                      if found:
+                          cand = sorted(found)[-1]
+                          return float(cand)
+                  except Exception as e:
+                      print("FINRA link read error:", e, "link:", link)
+                      continue
+              return None
 
-          if alert:
-              msg = "📉 시장 위험 신호 발생!\n" + "\n".join(alert)
-              send_telegram(msg)
+          # ---------- 버핏지수(선택) ----------
+          def fetch_buffett_from_csv(csv_url):
+              try:
+                  r = requests.get(csv_url, timeout=20); r.raise_for_status()
+                  df = pd.read_csv(io.StringIO(r.text))
+                  numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+                  if numeric_cols:
+                      col = numeric_cols[-1]
+                      val = df[col].dropna().iloc[-1]
+                      return float(val)
+                  # fallback: try last row string parse
+                  for c in df.columns[::-1]:
+                      vals = df[c].dropna().astype(str)
+                      if not vals.empty:
+                          s = vals.iloc[-1]
+                          m = re.search(r'([0-9]+\.[0-9]+|[0-9]+)', s.replace(',', ''))
+                          if m:
+                              return float(m.group(1))
+                  return None
+              except Exception as e:
+                  print("fetch_buffett error", e)
+                  return None
 
-          EOF
+          # ---------- 수집: 주요 지표 ----------
+          FED = fred_latest("FEDFUNDS")
+          dgs10 = fred_latest("DGS10")
+          dgs2 = fred_latest("DGS2")
+          hy_oas = fred_latest("BAMLH0A0HYM2")
+          yield_curve = None
+          if dgs10 is not None and dgs2 is not None:
+              yield_curve = dgs10 - dgs2
+
+          margin = fetch_finra_margin_from_page(FINRA_PAGE_URL)
+          buffett = fetch_buffett_from_csv(BUFFET_CSV_URL) if BUFFET_CSV_URL else None
+
+          # 시계열(그래프) 가능한 데이터 수집
+          dates_yc10, vals_dgs10 = fred_series("DGS10", limit=180)
+          dates_yc2, vals_dgs2 = fred_series("DGS2", limit=180)
+          _, vals_hy = fred_series("BAMLH0A0HYM2", limit=180)
+
+          # ---------- 합성 신호 계산 (정규화 및 가중합) ----------
+          def clamp(x, lo=0.0, hi=1.0):
+              try:
+                  return max(lo, min(hi, float(x)))
+              except:
+                  return lo
+
+          # VIX와 SP500 드로우다운 시도(선택; 실패 시 무시)
+          def fetch_vix():
+              return fred_latest("VIXCLS")
+          def fetch_sp_drawdown():
+              # SP500 역사치 (SP500 시리즈 id는 'SP500'이 아닌 경우가 있음; FRED에 'SP500' 시리즈 존재 여부 확인)
+              try:
+                  dates_sp, vals_sp = fred_series("SP500", limit=60)
+                  if not vals_sp:
+                      return None
+                  recent_max = max(vals_sp)
+                  recent_min = min(vals_sp)
+                  return (recent_max - recent_min) / recent_max * 100.0
+              except:
+                  return None
+
+          vix = fetch_vix()
+          sp_draw = fetch_sp_drawdown()
+
+          # 점수 산출
+          yc_score = clamp((0 - (yield_curve if yield_curve is not None else 0.0)) / 2.0)
+          hy_score = clamp(((hy_oas if hy_oas is not None else 0.0) - 200.0) / 400.0)
+          margin_score = clamp(((margin if margin is not None else 0.0) / 1.0e12 - 0.5) / 1.5)
+          vix_score = clamp(((vix if vix is not None else 15.0) - 15.0) / 25.0)
+          sp_score = clamp(((sp_draw if sp_draw is not None else 0.0) / 20.0))
+          buffett_score = clamp(((buffett if buffett is not None else 0.0) - 150.0) / 150.0)
+
+          weights = {"yc":0.20, "hy":0.25, "margin":0.20, "vix":0.15, "sp":0.15, "buffett":0.05}
+          total_w = weights["yc"] + weights["hy"] + weights["margin"] + weights["vix"] + weights["sp"] + (weights["buffett"] if buffett is not None else 0)
+          R = (yc_score*weights["yc"] + hy_score*weights["hy"] + margin_score*weights["margin"] + vix_score*weights["vix"] + sp_score*weights["sp"] + (buffett_score*weights["buffett"] if buffett is not None else 0.0)) / total_w
+
+          # 권고 매도 비율(예시)
+          if R < 0.35:
+              sell_reco = "유지"
+              sell_pct = 0
+          elif R < 0.6:
+              sell_reco = "주의 - 방어자산 일부 매도 고려"
+              sell_pct = 0.10
+          elif R < 0.8:
+              sell_reco = "경고 - 방어자산 추가 매도 권고"
+              sell_pct = 0.35
+          else:
+              sell_reco = "위기 - 즉시 유동성 확보 권고"
+              sell_pct = 0.75
+
+          # ---------- 시각화: 차트 생성 ----------
+          try:
+              fig = plt.figure(figsize=(10, 10))
+              # 1) 상단: 10y & 2y 시계열(있을 때)
+              ax1 = fig.add_subplot(3,1,1)
+              if vals_dgs10 and vals_dgs2:
+                  ax1.plot(dates_yc10, vals_dgs10, label='10y')
+                  ax1.plot(dates_yc2, vals_dgs2, label='2y')
+                  ax1.set_title('10y vs 2y (최근)')
+                  ax1.tick_params(axis='x', rotation=20)
+                  ax1.legend()
+              else:
+                  ax1.text(0.1,0.5,'10y/2y 데이터 없음', transform=ax1.transAxes)
+
+              # 2) 중간: HY OAS 시계열
+              ax2 = fig.add_subplot(3,1,2)
+              if vals_hy:
+                  ax2.plot(range(len(vals_hy)), vals_hy)
+                  ax2.set_title('HY OAS (최근)')
+                  ax2.tick_params(axis='x', rotation=20)
+              else:
+                  ax2.text(0.1,0.5,'HY OAS 데이터 없음', transform=ax2.transAxes)
+
+              # 3) 하단: 지표 점수 바차트
+              ax3 = fig.add_subplot(3,1,3)
+              labels = ['10y-2y','HY OAS','Margin','VIX','SP DD'] + (['Buffett'] if buffett is not None else [])
+              scores = [yc_score, hy_score, margin_score, vix_score, sp_score] + ([buffett_score] if buffett is not None else [])
+              ax3.bar(range(len(scores)), scores)
+              ax3.set_ylim(0,1)
+              ax3.set_xticks(range(len(scores)))
+              ax3.set_xticklabels(labels, rotation=30)
+              ax3.set_title('지표별 리스크 점수 (0-1)')
+
+              plt.tight_layout()
+              img_path = "/tmp/market_monitor_chart.png"
+              fig.savefig(img_path, dpi=150)
+              plt.close(fig)
+              chart_ok = True
+          except Exception as e:
+              print("chart generation error:", e)
+              chart_ok = False
+              img_path = None
+
+          # ---------- 이상징후가 있을 때만 알림 전송 ----------
+          alerts = []
+          if yield_curve is not None and yield_curve < 0:
+              alerts.append(f"장단기 금리 역전 (10y-2y): {yield_curve:.2f}%")
+          if hy_oas is not None and hy_oas > HY_OAS_THRESHOLD:
+              alerts.append(f"하이일드 OAS 과열: {hy_oas} bp (임계치 {HY_OAS_THRESHOLD})")
+          if margin is not None and margin > MARGIN_THRESHOLD:
+              alerts.append(f"마진부채 급증: ${margin:,.0f} (임계치 ${MARGIN_THRESHOLD:,.0f})")
+          if buffett is not None and buffett > BUFFET_THRESHOLD:
+              alerts.append(f"버핏지수 과대평가: {buffett} (임계치 {BUFFET_THRESHOLD})")
+
+          # Composite 기반 추가 조건 (옵션)
+          if R >= 0.35 and ("합성 R 경계" not in alerts):
+              # 여기는 별도 알림조건으로 사용자가 원하면 활성화(현재는 composite 기반 권고 포함)
+              alerts.append(f"합성위험 R = {R:.2f} (권고: {sell_reco}, 권장 매도비율 예시: {int(sell_pct*100)}%)")
+
+          if alerts:
+              text = "🚨 자동감시 경보\n" + f"시각: {now}\n\n" + "\n".join(["• " + a for a in alerts]) + "\n\n" + f"요약: FED={FED} 10y={dgs10} 2y={dgs2} 10y-2y={yield_curve} HY_OAS={hy_oas} Margin={margin} Buffett={buffett}\n"
+              # 텍스트 전송 먼저
+              tx_ok = telegram_send_text(text)
+              # 차트 전송(가능하면)
+              if chart_ok and img_path:
+                  cap = f"Composite R={R:.2f} | 권고: {sell_reco} | 매도 예시 {int(sell_pct*100)}%"
+                  photo_ok = telegram_send_photo(img_path, caption=cap)
+                  if not photo_ok:
+                      print("차트 전송 실패.")
+              print("Alert sent.")
+          else:
+              print(now, "- 이상징후 없음. 알림 미전송.")
+          PYCODE
