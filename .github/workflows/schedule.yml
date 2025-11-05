@@ -1,8 +1,8 @@
-name: GLD_TLT_SellSignal_Monitor
+name: Macro Risk Monitor (GLD/TLT 실전용)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # 매 정각 실행 (1시간마다)
+    - cron: '0 * * * *'  # 매 시간
   workflow_dispatch:
 
 jobs:
@@ -10,314 +10,103 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy yfinance openpyxl beautifulsoup4 lxml
+          pip install requests pandas numpy
 
-      - name: Run GLD/TLT sell-signal monitor
+      - name: Run Macro Risk Check
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          FINRA_PAGE_URL: ${{ secrets.FINRA_PAGE_URL }}
-          BUFFET_CSV_URL: ${{ secrets.BUFFET_CSV_URL }}
+          FINRA_CSV_URL: ${{ secrets.FINRA_CSV_URL }}
         run: |
-          python3 - <<'PYCODE'
-          import os, requests, io, re, math
-          import pandas as pd, numpy as np
-          import yfinance as yf
-          from datetime import datetime, timedelta
-          from bs4 import BeautifulSoup
+          python - <<'EOF'
+          import os
+          import requests
+          import pandas as pd
+          import numpy as np
 
-          # 환경변수
-          TOKEN = os.getenv("TELEGRAM_TOKEN")
-          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-          FRED_KEY = os.getenv("FRED_API_KEY")
-          FINRA_PAGE_URL = os.getenv("FINRA_PAGE_URL") or "https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics"
-          BUFFET_CSV_URL = os.getenv("BUFFET_CSV_URL")
+          BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+          CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+          FRED_KEY = os.environ['FRED_API_KEY']
+          FINRA_URL = os.environ['FINRA_CSV_URL']
 
-          now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+          # -------------------------
+          # FRED 데이터 가져오기
+          def get_fred(series_id):
+              url = f'https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_KEY}&file_type=json'
+              r = requests.get(url)
+              data = r.json()['observations']
+              df = pd.DataFrame(data)
+              df['value'] = pd.to_numeric(df['value'], errors='coerce')
+              return df
 
-          def telegram_send(text):
-              if not TOKEN or not CHAT_ID:
-                  print("텔레그램 설정 누락")
-                  return False
-              url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-              try:
-                  r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
-                  print("telegram status", r.status_code)
-                  return r.status_code == 200
-              except Exception as e:
-                  print("telegram error", e)
-                  return False
+          # 핵심지표
+          vix = get_fred('VIXCLS')['value'].iloc[-1]
+          hy_oas = get_fred('BAMLH0A0HYM2')['value'].iloc[-1]
+          tips10y = get_fred('DFII10')['value'].iloc[-1]
 
-          # ---------- data helpers ----------
-          def fred_latest(series_id):
-              url = "https://api.stlouisfed.org/fred/series/observations"
-              params = {"series_id": series_id, "api_key": FRED_KEY, "file_type":"json", "limit":1, "sort_order":"desc"}
-              try:
-                  r = requests.get(url, params=params, timeout=20); r.raise_for_status()
-                  j = r.json().get("observations", [])
-                  if not j: return None
-                  v = j[0].get("value")
-                  if v in (".", "", None): return None
-                  return float(v)
-              except Exception as e:
-                  print("fred_latest error", series_id, e)
-                  return None
+          # FINRA 마진부채
+          margin_df = pd.read_csv(FINRA_URL)
+          margin_latest = margin_df['total'].iloc[-1]
 
-          def fred_series(series_id, days=200):
-              url = "https://api.stlouisfed.org/fred/series/observations"
-              params = {"series_id": series_id, "api_key": FRED_KEY, "file_type":"json", "limit":days, "sort_order":"desc"}
-              try:
-                  r = requests.get(url, params=params, timeout=30); r.raise_for_status()
-                  obs = r.json().get("observations", [])
-                  if not obs: return []
-                  vals = [float(o["value"]) for o in obs if o.get("value") not in (".", "", None)]
-                  return vals[::-1]  # chronological
-              except Exception as e:
-                  print("fred_series error", series_id, e)
-                  return []
+          # GLD/TLT 가격
+          gld_df = get_fred('GLD')
+          tlt_df = get_fred('TLT')
 
-          def fetch_finra_margin():
-              try:
-                  r = requests.get(FINRA_PAGE_URL, timeout=20); r.raise_for_status()
-                  soup = BeautifulSoup(r.text, "lxml")
-                  links = []
-                  for a in soup.find_all("a", href=True):
-                      href = a['href']
-                      if re.search(r'\.xls[x]?$', href, re.IGNORECASE):
-                          links.append(href if href.startswith("http") else requests.compat.urljoin(FINRA_PAGE_URL, href))
-                  for link in links:
-                      try:
-                          rr = requests.get(link, timeout=30); rr.raise_for_status()
-                          df = pd.read_excel(io.BytesIO(rr.content), header=None)
-                          # 마지막 20행 탐색
-                          found = []
-                          for r_i in range(max(0, df.shape[0]-20), df.shape[0]):
-                              for cell in df.iloc[r_i]:
-                                  s = str(cell)
-                                  if re.search(r'[\d\$,]{3,}', s):
-                                      s2 = re.sub(r'[^0-9.\-]', '', s)
-                                      try:
-                                          found.append(float(s2))
-                                      except:
-                                          pass
-                          if found:
-                              return sorted(found)[-1]
-                      except Exception as e:
-                          continue
-              except Exception as e:
-                  print("fetch_finra error", e)
-              return None
+          # -------------------------
+          # RSI 계산
+          def rsi(prices, period=14):
+              delta = prices.diff()
+              up, down = delta.copy(), delta.copy()
+              up[up < 0] = 0
+              down[down > 0] = 0
+              roll_up = up.rolling(period).mean()
+              roll_down = down.abs().rolling(period).mean()
+              rs = roll_up / roll_down
+              return 100 - (100 / (1 + rs))
 
-          # ---------- price helpers (yfinance) ----------
-          def get_hist(ticker, period="6mo", interval="1d"):
-              try:
-                  t = yf.Ticker(ticker)
-                  df = t.history(period=period, interval=interval)
-                  if df is None or df.empty:
-                      return None
-                  return df
-              except Exception as e:
-                  print("yfinance error", ticker, e)
-                  return None
+          gld_rsi = rsi(gld_df['value']).iloc[-1]
+          tlt_rsi = rsi(tlt_df['value']).iloc[-1]
 
-          def compute_RSI(series, window=14):
-              # series: pandas Series of close prices
-              delta = series.diff()
-              up = delta.clip(lower=0)
-              down = -1*delta.clip(upper=0)
-              ma_up = up.ewm(com=window-1, adjust=False).mean()
-              ma_down = down.ewm(com=window-1, adjust=False).mean()
-              rs = ma_up / ma_down
-              rsi = 100 - (100 / (1 + rs))
-              return rsi
+          # 모멘텀 계산 (5일 % 변화)
+          gld_mom = gld_df['value'].pct_change(5).iloc[-1]
+          tlt_mom = tlt_df['value'].pct_change(5).iloc[-1]
 
-          # ---------- signal checks per group ----------
-          # Group 1: 금리 전환 (TLT 주로 적용)
-          def signal_rate_transition():
-              # 10y 최근 변화(20일 대비)
-              dgs10_series = fred_series("DGS10", days=60)
-              if len(dgs10_series) < 25:
-                  return False, "DGS10 데이터 부족"
-              recent = dgs10_series[-1]
-              past20 = dgs10_series[-21]
-              # 20일 대비 0.25%p 이상 상승 전환
-              cond = (recent - past20) >= 0.25
-              reason = f"10y change: {recent - past20:.3f}"
-              return cond, reason
+          # -------------------------
+          # 핵심지표 체크 (1개 이상 충족)
+          core_flags = [
+              vix >= 28,
+              hy_oas >= 450,
+              tips10y >= 2.0,
+              margin_latest >= 1.2e12
+          ]
+          core_signal = any(core_flags)
 
-          def signal_yield_curve_normalizing():
-              # 역전→정상화 여부 (10y-2y)
-              y10 = fred_latest("DGS10"); y2 = fred_latest("DGS2")
-              if y10 is None or y2 is None:
-                  return False, "10y/2y 데이터 부족"
-              yc = y10 - y2
-              # 기준: 10y-2y가 +0.5%p 이상
-              cond = yc >= 0.5
-              return cond, f"10y-2y={yc:.3f}"
+          # 보조지표 체크 (1개 이상 충족)
+          sub_flags = [
+              gld_rsi > 70,
+              tlt_rsi > 70,
+              gld_mom < -0.01,
+              tlt_mom < -0.01
+          ]
+          sub_signal = any(sub_flags)
 
-          def signal_real_rate_rising():
-              # 실질금리(10y - TIPS10) 상승 3주 연속
-              dgs10 = fred_series("DGS10", days=30)
-              tips = fred_series("DFII10", days=30)  # DFII10는 예시(실질금리 시리즈 가용성 확인 필요)
-              if not dgs10 or not tips or len(dgs10)<21 or len(tips)<21:
-                  return False, "실질금리 데이터 부족"
-              real = np.array(dgs10[-21:]) - np.array(tips[-21:])
-              # 최근 3주(15거래일 ~ 3주) 연속 상승 판단: 최근 3 값이 증가 추세
-              if len(real) < 15:
-                  return False, "실질금리 시계열 짧음"
-              recent = real[-15:]
-              cond = (recent[-1] > recent[-6]) and (recent[-6] > recent[-11])
-              return bool(cond), f"real last:{recent[-1]:.3f}"
-
-          # Group 2: 실물 회복 (PMI/실업/GDPNow) - 일부는 외부 소스가 필요하므로 가능하면 대체
-          def signal_real_activity():
-              # 대체: SP500 30일 모멘텀(주식 강세는 경기 회복과 연동될 수 있음)
-              sp = get_hist("^GSPC", period="6mo")
-              if sp is None or sp.empty:
-                  return False, "SP500 데이터 부족"
-              close = sp['Close']
-              mom30 = (close.iloc[-1] / close.iloc[-31] - 1) * 100 if len(close)>31 else 0
-              cond = mom30 > 2.0  # 30일 내 2% 이상 상승이면 경기 모멘텀으로 간주(대체지표)
-              return cond, f"SP500 30d mom {mom30:.2f}%"
-
-          # Group 3: 위험자산 선호
-          def signal_risk_on():
-              vix = get_hist("^VIX", period="3mo")
-              hy_oas = fred_latest("BAMLH0A0HYM2")
-              sp = get_hist("^GSPC", period="3mo")
-              reasons = []
-              conds = []
-              if vix is not None and not vix.empty:
-                  vix_now = vix['Close'].iloc[-1]
-                  conds.append(vix_now <= 15)
-                  reasons.append(f"VIX {vix_now:.1f}")
-              else:
-                  reasons.append("VIX missing")
-              if hy_oas is not None:
-                  conds.append(hy_oas <= 350)
-                  reasons.append(f"HY OAS {hy_oas}")
-              else:
-                  reasons.append("HY missing")
-              if sp is not None and not sp.empty:
-                  close = sp['Close']
-                  above50 = close.iloc[-1] > close.rolling(window=50).mean().iloc[-1] if len(close)>50 else False
-                  conds.append(bool(above50))
-                  reasons.append(f"SP50 MA above {above50}")
-              # majority true -> risk-on
-              true_count = sum([1 for c in conds if c])
-              cond = true_count >= 2
-              return cond, "; ".join(reasons)
-
-          # Group 4: 자산 자체 과열 (RSI, MA deviation)
-          def signal_asset_overheat(ticker, asset_name):
-              df = get_hist(ticker, period="6mo")
-              if df is None or df.empty:
-                  return False, f"{asset_name} price missing"
-              close = df['Close'].dropna()
-              if len(close) < 60:
-                  return False, f"{asset_name} series too short"
-              rsi = compute_RSI(close, window=14)
-              rsi_now = rsi.iloc[-1]
-              ma20 = close.rolling(window=20).mean().iloc[-1]
-              dev20 = (close.iloc[-1] / ma20 - 1) * 100
-              # 기준: RSI TLT>=65 GLD>=70, dev20 TLT>=5% GLD>=6%
-              if asset_name == "TLT":
-                  conds = [rsi_now >= 65, dev20 >= 5.0]
-              else:
-                  conds = [rsi_now >= 70, dev20 >= 6.0]
-              true_count = sum(1 for c in conds if c)
-              reason = f"RSI={rsi_now:.1f}, dev20={dev20:.2f}%"
-              return (true_count >= 2), reason
-
-          # Group 5: 상관구조 붕괴 (TLT/SPY, GLD/SPY correlations)
-          def signal_corr_change(ticker_asset, ticker_ref="SPY"):
-              # 최근 20일 상관계수 계산
-              df_asset = get_hist(ticker_asset, period="3mo")
-              df_ref = get_hist(ticker_ref, period="3mo")
-              if df_asset is None or df_ref is None:
-                  return False, "price missing"
-              common = pd.concat([df_asset['Close'], df_ref['Close']], axis=1, join='inner').dropna()
-              if common.shape[0] < 30:
-                  return False, "insufficient overlap"
-              corr = common.iloc[-30:,:].corr().iloc[0,1]
-              # 상관계수가 +0.2 이상이면 안전자산 역할 약화(우리 기준)
-              return (corr >= 0.2), f"corr={corr:.2f}"
-
-          # ---------- orchestrate signals for TLT and GLD ----------
-          assets = {
-              "TLT": {"ticker":"TLT", "signals":[]},
-              "GLD": {"ticker":"GLD", "signals":[]}
-          }
-
-          # Gather common metrics once
-          try:
-              hy_oas_val = fred_latest("BAMLH0A0HYM2")
-          except:
-              hy_oas_val = None
-          try:
-              margin_val = fetch_finra_margin()
-          except:
-              margin_val = None
-
-          # Evaluate signals per asset
-          for name, meta in assets.items():
-              sig_list = []
-              # 1) 금리 전환 (TLT 중심 but applied to both as condition)
-              s1, r1 = signal_rate_transition()
-              sig_list.append(("금리전환", bool(s1), r1))
-              # 1b) yield curve normalize
-              s1b, r1b = signal_yield_curve_normalizing()
-              sig_list.append(("역전->정상화", bool(s1b), r1b))
-              # 1c) 실질금리
-              s1c, r1c = signal_real_rate_rising()
-              sig_list.append(("실질금리상승", bool(s1c), r1c))
-
-              # 2) 실물 회복
-              s2, r2 = signal_real_activity()
-              sig_list.append(("실물회복(대체)", bool(s2), r2))
-
-              # 3) 위험자산 선호
-              s3, r3 = signal_risk_on()
-              sig_list.append(("위험선호확대", bool(s3), r3))
-
-              # 4) 자산 자체 과열 (RSI+MA dev)
-              s4, r4 = signal_asset_overheat(meta["ticker"], name)
-              sig_list.append(("자산과열", bool(s4), r4))
-
-              # 5) 상관구조 변화
-              s5, r5 = signal_corr_change(meta["ticker"], "SPY")
-              sig_list.append(("상관구조붕괴", bool(s5), r5))
-
-              meta["signals"] = sig_list
-
-          # ---------- decide and build message ----------
-          alerts = []
-          for name, meta in assets.items():
-              checks = meta["signals"]
-              true_count = sum(1 for t,flag,reason in checks if flag)
-              details = "\n".join([f"• {title}: {'Y' if flag else 'N'} ({reason})" for title,flag,reason in checks])
-              if true_count >= 3:
-                  text = f"📉 [{name}] 매도 신호 발생 ({true_count}/5)\n\n근거:\n{details}\n\n참고: 자동 매도 아님 — 수동 판단 필요"
-                  alerts.append(text)
-
-          # send alerts if any
-          if alerts:
-              # combine and send (separate messages)
-              for msg in alerts:
-                  telegram_send(msg)
-                  print("Sent alert for asset.")
+          # -------------------------
+          # 매도 신호 판단 및 Telegram 전송
+          if core_signal and sub_signal:
+              msg = f"⚠️ 매도 신호 발생\n핵심지표: {core_flags}\n보조지표: {sub_flags}\nGLD: {gld_df['value'].iloc[-1]:.2f}, TLT: {tlt_df['value'].iloc[-1]:.2f}"
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              requests.get(url, params={"chat_id": CHAT_ID, "text": msg})
           else:
-              print(now, "- 매도 신호 없음.")
-
-          PYCODE
+              print("매도 신호 없음")
+          EOF
