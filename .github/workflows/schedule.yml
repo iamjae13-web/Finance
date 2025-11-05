@@ -1,4 +1,4 @@
-name: Macro Risk Monitor (GLD/TLT 실전용)
+name: Macro Risk Monitor (Safe FINRA Check)
 
 on:
   schedule:
@@ -40,6 +40,9 @@ jobs:
           FRED_KEY = os.environ['FRED_API_KEY']
           FINRA_URL = os.environ['FINRA_CSV_URL']
 
+          if not FINRA_URL:
+              raise ValueError("FINRA_CSV_URL이 설정되어 있지 않습니다.")
+
           # -------------------------
           # FRED 데이터 가져오기
           def get_fred(series_id):
@@ -56,8 +59,12 @@ jobs:
           tips10y = get_fred('DFII10')['value'].iloc[-1]
 
           # FINRA 마진부채
-          margin_df = pd.read_csv(FINRA_URL)
-          margin_latest = margin_df['total'].iloc[-1]
+          try:
+              margin_df = pd.read_csv(FINRA_URL)
+              margin_latest = margin_df['total'].iloc[-1]
+          except Exception as e:
+              print(f"FINRA CSV 로드 실패: {e}")
+              margin_latest = 0  # 실패시 기본값
 
           # GLD/TLT 가격
           gld_df = get_fred('GLD')
@@ -106,7 +113,10 @@ jobs:
           if core_signal and sub_signal:
               msg = f"⚠️ 매도 신호 발생\n핵심지표: {core_flags}\n보조지표: {sub_flags}\nGLD: {gld_df['value'].iloc[-1]:.2f}, TLT: {tlt_df['value'].iloc[-1]:.2f}"
               url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-              requests.get(url, params={"chat_id": CHAT_ID, "text": msg})
+              try:
+                  requests.get(url, params={"chat_id": CHAT_ID, "text": msg})
+              except Exception as e:
+                  print(f"Telegram 전송 실패: {e}")
           else:
               print("매도 신호 없음")
           EOF
