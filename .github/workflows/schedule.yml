@@ -1,8 +1,8 @@
-name: Macro Risk Monitor (Safe FINRA Check)
+name: GLD_TLT_Sell_Monitor_NoFINRA
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 매 시간
+    - cron: '0 * * * *'   # 매 정각 실행 (1시간마다)
   workflow_dispatch:
 
 jobs:
@@ -10,113 +10,213 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy
+          pip install requests pandas numpy yfinance
 
-      - name: Run Macro Risk Check
+      - name: Run GLD/TLT sell-signal check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          FINRA_CSV_URL: ${{ secrets.FINRA_CSV_URL }}
         run: |
-          python - <<'EOF'
-          import os
+          python - <<'PY'
+          import os, sys, traceback
           import requests
           import pandas as pd
           import numpy as np
+          import yfinance as yf
+          from datetime import datetime, timedelta
 
-          BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
-          CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-          FRED_KEY = os.environ['FRED_API_KEY']
-          FINRA_URL = os.environ['FINRA_CSV_URL']
+          # --- 환경변수 / 안전확인 ---
+          BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+          FRED_KEY = os.getenv("FRED_API_KEY")
 
-          if not FINRA_URL:
-              raise ValueError("FINRA_CSV_URL이 설정되어 있지 않습니다.")
+          def safe_print(*a, **k): print(*a, **k); sys.stdout.flush()
 
-          # -------------------------
-          # FRED 데이터 가져오기
-          def get_fred(series_id):
-              url = f'https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={FRED_KEY}&file_type=json'
-              r = requests.get(url)
-              data = r.json()['observations']
-              df = pd.DataFrame(data)
-              df['value'] = pd.to_numeric(df['value'], errors='coerce')
-              return df
+          if not BOT_TOKEN or not CHAT_ID or not FRED_KEY:
+              safe_print("ERROR: 필수 Secrets 누락. TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / FRED_API_KEY 확인하십시오.")
+              sys.exit(1)
 
-          # 핵심지표
-          vix = get_fred('VIXCLS')['value'].iloc[-1]
-          hy_oas = get_fred('BAMLH0A0HYM2')['value'].iloc[-1]
-          tips10y = get_fred('DFII10')['value'].iloc[-1]
+          now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+          safe_print("시각:", now)
 
-          # FINRA 마진부채
-          try:
-              margin_df = pd.read_csv(FINRA_URL)
-              margin_latest = margin_df['total'].iloc[-1]
-          except Exception as e:
-              print(f"FINRA CSV 로드 실패: {e}")
-              margin_latest = 0  # 실패시 기본값
+          # --- 유틸: FRED에서 시계열 또는 최신값 가져오기 ---
+          def fred_series(series_id, limit=365):
+              try:
+                  url = "https://api.stlouisfed.org/fred/series/observations"
+                  params = {"series_id": series_id, "api_key": FRED_KEY, "file_type": "json", "limit": limit, "sort_order": "desc"}
+                  r = requests.get(url, params=params, timeout=30); r.raise_for_status()
+                  obs = r.json().get("observations", [])
+                  vals = [(o.get("date"), o.get("value")) for o in obs if o.get("value") not in (".", "", None)]
+                  if not vals:
+                      return pd.Series(dtype=float)
+                  df = pd.DataFrame(vals, columns=["date","value"])
+                  df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                  df["date"] = pd.to_datetime(df["date"])
+                  df = df.sort_values("date").reset_index(drop=True)
+                  return df.set_index("date")["value"]
+              except Exception as e:
+                  safe_print("fred_series error", series_id, e)
+                  return pd.Series(dtype=float)
 
-          # GLD/TLT 가격
-          gld_df = get_fred('GLD')
-          tlt_df = get_fred('TLT')
+          def fred_latest(series_id):
+              s = fred_series(series_id, limit=5)
+              return float(s.iloc[-1]) if not s.empty else None
 
-          # -------------------------
-          # RSI 계산
-          def rsi(prices, period=14):
-              delta = prices.diff()
-              up, down = delta.copy(), delta.copy()
-              up[up < 0] = 0
-              down[down > 0] = 0
-              roll_up = up.rolling(period).mean()
-              roll_down = down.abs().rolling(period).mean()
-              rs = roll_up / roll_down
-              return 100 - (100 / (1 + rs))
-
-          gld_rsi = rsi(gld_df['value']).iloc[-1]
-          tlt_rsi = rsi(tlt_df['value']).iloc[-1]
-
-          # 모멘텀 계산 (5일 % 변화)
-          gld_mom = gld_df['value'].pct_change(5).iloc[-1]
-          tlt_mom = tlt_df['value'].pct_change(5).iloc[-1]
-
-          # -------------------------
-          # 핵심지표 체크 (1개 이상 충족)
-          core_flags = [
-              vix >= 28,
-              hy_oas >= 450,
-              tips10y >= 2.0,
-              margin_latest >= 1.2e12
-          ]
-          core_signal = any(core_flags)
-
-          # 보조지표 체크 (1개 이상 충족)
-          sub_flags = [
-              gld_rsi > 70,
-              tlt_rsi > 70,
-              gld_mom < -0.01,
-              tlt_mom < -0.01
-          ]
-          sub_signal = any(sub_flags)
-
-          # -------------------------
-          # 매도 신호 판단 및 Telegram 전송
-          if core_signal and sub_signal:
-              msg = f"⚠️ 매도 신호 발생\n핵심지표: {core_flags}\n보조지표: {sub_flags}\nGLD: {gld_df['value'].iloc[-1]:.2f}, TLT: {tlt_df['value'].iloc[-1]:.2f}"
+          # --- 유틸: 텔레그램 전송 ---
+          def send_telegram(text):
               url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
               try:
-                  requests.get(url, params={"chat_id": CHAT_ID, "text": msg})
+                  r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
+                  safe_print("Telegram status", r.status_code)
+                  return r.status_code == 200
               except Exception as e:
-                  print(f"Telegram 전송 실패: {e}")
+                  safe_print("Telegram send error:", e)
+                  return False
+
+          # --- 지표 수집 ---
+          # (핵심 후보) VIX, HY OAS, 10y, 2y, UNRATE, M2
+          vix = fred_latest("VIXCLS")            # VIX
+          hy_oas = fred_latest("BAMLH0A0HYM2")  # HY OAS (bp)
+          dgs10 = fred_latest("DGS10")
+          dgs2 = fred_latest("DGS2")
+          unrate_series = fred_series("UNRATE", limit=90)  # monthly
+          m2_series = fred_series("M2SL", limit=400)
+
+          # 실시간 가격은 yfinance로 GLD/TLT/SPY
+          def get_price_series(ticker, period="180d"):
+              try:
+                  t = yf.Ticker(ticker)
+                  df = t.history(period=period, interval="1d")
+                  if df is None or df.empty:
+                      return pd.Series(dtype=float)
+                  return df["Close"].dropna()
+              except Exception as e:
+                  safe_print("yfinance error", ticker, e)
+                  return pd.Series(dtype=float)
+
+          gld = get_price_series("GLD", period="180d")
+          tlt = get_price_series("TLT", period="180d")
+          spy = get_price_series("SPY", period="180d")
+
+          # --- 기본 체크 ---
+          safe_print("데이터 요약 (가능한 것만):")
+          safe_print("VIX:", vix, "HY_OAS:", hy_oas, "DGS10:", dgs10, "DGS2:", dgs2)
+          safe_print("UNRATE latest:", unrate_series.iloc[-1] if not unrate_series.empty else None)
+          safe_print("M2 latest:", m2_series.iloc[-1] if not m2_series.empty else None)
+          safe_print("GLD last:", gld.iloc[-1] if not gld.empty else None, "TLT last:", tlt.iloc[-1] if not tlt.empty else None)
+
+          # --- 파생 지표 계산 ---
+          # 장단기 금리차 (10y - 2y), 단위: %p
+          yield_curve = None
+          if dgs10 is not None and dgs2 is not None:
+              yield_curve = dgs10 - dgs2
+
+          # 실업률 MoM: 최신달과 바로 이전달 비교 (절대 차이)
+          unrate_mom_drop = False
+          if not unrate_series.empty and len(unrate_series) >= 2:
+              last = float(unrate_series.iloc[-1])
+              prev = float(unrate_series.iloc[-2])
+              unrate_mom_drop = (last < prev - 0.10)  # 0.10%p 이상 하락이면 개선으로 간주
+
+          # M2 연율(최근 12개월) 증감(단순 YoY %)
+          m2_yoy_pos = False
+          if not m2_series.empty and len(m2_series) >= 13:
+              m2_yoy = (m2_series.iloc[-1] / m2_series.iloc[-13] - 1) * 100
+              m2_yoy_pos = (m2_yoy > 0)  # M2가 YoY 증가면 양호 신호
+
+          # --- 기술적 지표: RSI(14), 모멘텀(5일) ---
+          def compute_rsi(series, period=14):
+              s = series.dropna()
+              if s.shape[0] < period+2:
+                  return None
+              delta = s.diff()
+              up = delta.clip(lower=0)
+              down = -1 * delta.clip(upper=0)
+              ma_up = up.rolling(window=period).mean()
+              ma_down = down.rolling(window=period).mean()
+              rs = ma_up / ma_down
+              rsi = 100 - (100 / (1 + rs))
+              return rsi.iloc[-1]
+
+          def mom_pct(series, days=5):
+              s = series.dropna()
+              if s.shape[0] < days+1:
+                  return None
+              return (s.iloc[-1] / s.iloc[-(days+1)] - 1)
+
+          gld_rsi = compute_rsi(gld, 14)
+          tlt_rsi = compute_rsi(tlt, 14)
+          gld_mom5 = mom_pct(gld, 5)
+          tlt_mom5 = mom_pct(tlt, 5)
+
+          # SPY 50일 MA 위 여부 (주식 강세 표지)
+          spy_above_50 = False
+          if not spy.empty and len(spy) >= 60:
+              ma50 = spy.rolling(window=50).mean().iloc[-1]
+              spy_above_50 = spy.iloc[-1] > ma50
+
+          # --- 임계치에 따른 핵심/보조 플래그 ---
+          core_flags = []
+          try:
+              core_flags.append(("VIX low (<=15)", vix is not None and vix <= 15))
+              core_flags.append(("HY OAS tight (<=350bp)", hy_oas is not None and hy_oas <= 350))
+              core_flags.append(("Yield curve steep (10y-2y >= 0.50%)", yield_curve is not None and yield_curve >= 0.5))
+              core_flags.append(("Unrate MoM drop (>=0.10%p)", unrate_mom_drop))
+              core_flags.append(("M2 YoY positive", m2_yoy_pos))
+          except Exception as e:
+              safe_print("core flag calc error", e)
+
+          sub_flags = []
+          try:
+              sub_flags.append(("GLD RSI>=70", gld_rsi is not None and gld_rsi >= 70))
+              sub_flags.append(("TLT RSI>=70", tlt_rsi is not None and tlt_rsi >= 70))
+              sub_flags.append(("GLD 5d mom < -1%", gld_mom5 is not None and gld_mom5 <= -0.01))
+              sub_flags.append(("TLT 5d mom < -1%", tlt_mom5 is not None and tlt_mom5 <= -0.01))
+              sub_flags.append(("SPY above 50d MA", spy_above_50))
+          except Exception as e:
+              safe_print("sub flag calc error", e)
+
+          # 핵심 1개 이상 + 보조 1개 이상 충족 여부
+          core_true = sum(1 for k,v in core_flags if v)
+          sub_true = sum(1 for k,v in sub_flags if v)
+
+          safe_print("Core true count:", core_true, "| Sub true count:", sub_true)
+          safe_print("Core flags:", core_flags)
+          safe_print("Sub flags:", sub_flags)
+
+          # 알림 조건
+          if core_true >= 1 and sub_true >= 1:
+              lines = []
+              lines.append("🚨 GLD/TLT 매도 권고 알림 (참고용)")
+              lines.append(f"시각: {now}")
+              lines.append(f"핵심 충족개수: {core_true} / 보조 충족개수: {sub_true}")
+              lines.append("")
+              lines.append("핵심 지표 상세:")
+              for k,v in core_flags:
+                  lines.append(f"• {k}: {'Y' if v else 'N'}")
+              lines.append("")
+              lines.append("보조 지표 상세:")
+              for k,v in sub_flags:
+                  lines.append(f"• {k}: {'Y' if v else 'N'}")
+              lines.append("")
+              lines.append(f"GLD: {gld.iloc[-1] if not gld.empty else 'NA'}  /  TLT: {tlt.iloc[-1] if not tlt.empty else 'NA'}")
+              lines.append("참고: 자동매매 아님. 매도 권고는 사용자가 최종 판단하십시오.")
+              msg = "\n".join(lines)
+              send_telegram(msg)
+              safe_print("Alert sent.")
           else:
-              print("매도 신호 없음")
-          EOF
+              safe_print("조건 미충족: 알림 미전송")
+              safe_print("core_true, sub_true:", core_true, sub_true)
+
+          PY
