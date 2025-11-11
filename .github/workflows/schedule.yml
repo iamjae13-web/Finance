@@ -1,4 +1,4 @@
-name: GLD_TLT_Sell_Scoring_A1
+name: GLD_TLT_Final_Detailed_Monitor
 
 on:
   schedule:
@@ -17,42 +17,39 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas numpy yfinance
 
-      - name: Run GLD/TLT sell scoring (A-1)
+      - name: Run GLD/TLT Detailed Monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           python - <<'PY'
-          import os, sys
-          import requests, traceback
-          import pandas as pd, numpy as np
+          import os, sys, math, traceback
+          import requests, pandas as pd, numpy as np
           import yfinance as yf
           from datetime import datetime
 
-          # -------------------------
-          # 환경변수 확인
+          # ---------- 환경확인 ----------
           BOT = os.getenv("TELEGRAM_BOT_TOKEN")
           CHAT = os.getenv("TELEGRAM_CHAT_ID")
           FRED_KEY = os.getenv("FRED_API_KEY")
 
-          def eprint(*a, **k):
+          def log(*a, **k):
               print(*a, **k); sys.stdout.flush()
 
           if not BOT or not CHAT or not FRED_KEY:
-              eprint("ERROR: 필수 Secrets 누락. TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / FRED_API_KEY 확인하십시오.")
+              log("ERROR: 필수 Secrets 누락. TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / FRED_API_KEY 확인하십시오.")
               sys.exit(1)
 
           now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-          eprint("실행시각:", now)
+          log("실행시각:", now)
 
-          # -------------------------
-          # FRED helper
+          # ---------- 유틸: FRED 안전 호출 ----------
           def fred_series(series_id, limit=400):
               try:
                   url = "https://api.stlouisfed.org/fred/series/observations"
@@ -68,198 +65,269 @@ jobs:
                   df = df.sort_values("date").reset_index(drop=True)
                   return df.set_index("date")["value"]
               except Exception as e:
-                  eprint("fred_series error", series_id, e)
+                  log("fred_series error", series_id, e)
                   return pd.Series(dtype=float)
 
           def fred_latest(series_id):
-              s = fred_series(series_id, limit=5)
+              s = fred_series(series_id, limit=12)
               return float(s.iloc[-1]) if not s.empty else None
 
-          # -------------------------
-          # 데이터 수집 (7개 지표)
-          # 1) VIX
-          vix = fred_latest("VIXCLS")
-          # 2) HY OAS (bp)
-          hy_oas = fred_latest("BAMLH0A0HYM2")
-          # 3) Yield curve 10y-2y
-          dgs10 = fred_latest("DGS10")
-          dgs2 = fred_latest("DGS2")
-          yield_curve = (dgs10 - dgs2) if (dgs10 is not None and dgs2 is not None) else None
-          # 4) Unemployment rate series (UNRATE) - monthly
-          unrate = fred_series("UNRATE", limit=36)
-          # 5) M2 series
-          m2 = fred_series("M2SL", limit=400)
-          # 6) PMI (ISM manufacturing) - FRED series id candidate 'NAPM' (fallback allowed)
-          pmi = fred_series("NAPM", limit=120)
-          # 7) SPY momentum (30d) via yfinance
-          def yf_close(ticker, period="180d"):
+          # ---------- 유틸: yfinance 가격 시계열 ----------
+          def yf_close_series(ticker, period="365d"):
               try:
                   t = yf.Ticker(ticker)
                   df = t.history(period=period, interval="1d")
-                  if df is None or df.empty:
-                      return pd.Series(dtype=float)
-                  return df["Close"].dropna()
+                  return df["Close"].dropna() if df is not None and not df.empty else pd.Series(dtype=float)
               except Exception as e:
-                  eprint("yfinance error", ticker, e)
+                  log("yfinance error", ticker, e)
                   return pd.Series(dtype=float)
 
-          spy = yf_close("SPY", period="180d")
-          gld = yf_close("GLD", period="180d")
-          tlt = yf_close("TLT", period="180d")
+          # ---------- 지표 수집 (M2 제외) ----------
+          # 명목 금리
+          dgs10 = fred_latest("DGS10")
+          dgs2 = fred_latest("DGS2")
+          yield_curve = (dgs10 - dgs2) if (dgs10 is not None and dgs2 is not None) else None
 
-          # -------------------------
-          # 지표별 판단 (risk-on / sell-defense 신호)
-          flags = {}
+          # CPI YoY (간단 계산)
+          cpi_series = fred_series("CPIAUCSL", limit=36)
+          cpi_yoy = (cpi_series.iloc[-1] / cpi_series.iloc[-13] - 1)*100 if not cpi_series.empty and len(cpi_series)>=13 else None
 
-          # VIX: 낮을수록 위험자산 선호 → 방어자산 매도 유리
+          # 실질금리(근사)
+          real10 = (dgs10 - cpi_yoy) if (dgs10 is not None and cpi_yoy is not None) else None
+
+          # 달러(무역가중지수 대체)
+          dxy = fred_latest("DTWEXBGS")
+
+          # PMI (ISM Manufacturing)
+          pmi = fred_latest("NAPM")
+
+          # VIX, HY-OAS
+          vix = fred_latest("VIXCLS")
+          hy_oas = fred_latest("BAMLH0A0HYM2")
+
+          # 가격 시계열
+          gld = yf_close_series("GLD", period="365d")
+          tlt = yf_close_series("TLT", period="365d")
+          spy = yf_close_series("SPY", period="365d")
+
+          # 기술적 보조
+          def compute_rsi(series, period=14):
+              s = series.dropna()
+              if s.shape[0] < period+2:
+                  return None
+              delta = s.diff()
+              up = delta.clip(lower=0)
+              down = -1 * delta.clip(upper=0)
+              ma_up = up.rolling(period).mean()
+              ma_down = down.rolling(period).mean()
+              rs = ma_up / ma_down
+              rsi = 100 - (100 / (1 + rs))
+              return float(rsi.iloc[-1])
+
+          def mom_pct(series, days=5):
+              s = series.dropna()
+              if s.shape[0] < days+1:
+                  return None
+              return float((s.iloc[-1] / s.iloc[-(days+1)] - 1) * 100)
+
+          gld_rsi = compute_rsi(gld, 14)
+          tlt_rsi = compute_rsi(tlt, 14)
+          spy_mom30 = (spy.iloc[-1] / spy.iloc[-31] - 1) * 100 if not spy.empty and len(spy)>=31 else None
+
+          # GLD 보조 지표 (구리/금 비율)
+          copper = yf_close_series("HG=F", period="365d")
+          gold_fut = yf_close_series("GC=F", period="365d")
+          copper_gold_ratio = None
           try:
-              flags["VIX_low"] = (vix is not None and vix <= 15)
+              if not copper.empty and not gold_fut.empty:
+                  m = pd.concat([copper, gold_fut], axis=1, join='inner').dropna()
+                  if not m.empty:
+                      copper_gold_ratio = float(m.iloc[-1,0] / m.iloc[-1,1])
+          except Exception as e:
+              copper_gold_ratio = None
+
+          # TLT 보조 지표 (10y recent momentum)
+          dgs10_series = fred_series("DGS10", limit=120)
+          longrate_mom10 = None
+          try:
+              if not dgs10_series.empty and len(dgs10_series) >= 11:
+                  longrate_mom10 = float((dgs10_series.iloc[-1] / dgs10_series.iloc[-11] - 1) * 100)
           except:
-              flags["VIX_low"] = False
+              longrate_mom10 = None
 
-          # HY OAS tight (<=350bp) -> risk-on
-          try:
-              flags["HY_tight"] = (hy_oas is not None and hy_oas <= 350)
-          except:
-              flags["HY_tight"] = False
+          # ---------- 가중치(균형형) 설정 ----------
+          # 공통 가중치 (각 8)
+          common_w = {"Real10":8, "DXY":8, "YieldCurve":8, "PMI":8, "SPY_mom":8}
+          # GLD 전용 가중치
+          gld_w = {"GLD_RSI":8, "GLD_shares":7, "CopperGold":8, "VIX":7}
+          # TLT 전용 가중치
+          tlt_w = {"Real10":8, "FiveY5Y":7, "BondAuction":8, "LongRateMom":7}
 
-          # Yield curve steepening (10y-2y >= 0.5%p)
-          try:
-              flags["Yield_steep"] = (yield_curve is not None and yield_curve >= 0.5)
-          except:
-              flags["Yield_steep"] = False
-
-          # Unemployment MoM drop >=0.10%p improvement => 경기 호전 신호
-          try:
-              if not unrate.empty and len(unrate) >= 2:
-                  last_un = float(unrate.iloc[-1]); prev_un = float(unrate.iloc[-2])
-                  flags["Unrate_improve"] = (last_un <= prev_un - 0.10)
+          # ---------- 점수 산정 함수 (간단 안정형) ----------
+          def score_directional(val, dir_high=True):
+              # dir_high=True: higher value => 더 위험(매도 유리)
+              # dir_high=False: lower value => 더 위험(매도 유리)
+              if val is None:
+                  return 0.0
+              try:
+                  v = float(val)
+              except:
+                  return 0.0
+              # 간단 정규화: logistic-like mapping
+              if dir_high:
+                  sc = v / (abs(v) + 10.0)
               else:
-                  flags["Unrate_improve"] = False
-          except:
-              flags["Unrate_improve"] = False
+                  sc = (10.0 - v) / (10.0 + abs(v))
+              sc = max(0.0, min(1.0, sc))
+              return sc
 
-          # M2 YoY positive
-          try:
-              flags["M2_pos"] = False
-              if not m2.empty and len(m2) >= 13:
-                  m2_yoy = (m2.iloc[-1] / m2.iloc[-13] - 1) * 100
-                  flags["M2_pos"] = (m2_yoy > 0)
-          except:
-              flags["M2_pos"] = False
+          # ---------- 공통 값 매핑 (risk-on 방향=방어자산 매도 유리) ----------
+          # Real10: 낮을수록 risk-on for equities (하지만 TLT에는 높을수록 매도 유리 -> 처리 시 반영)
+          common_vals = {
+              "Real10": (real10, False),   # 낮을수록 risk-on for equities -> for scoring we use False (lower => higher score)
+              "DXY": (dxy, False),         # 낮을수록 risk-on (dxy 낮을때 주식 유리)
+              "YieldCurve": (yield_curve, True), # 높을수록 risk-on
+              "PMI": (pmi, True),
+              "SPY_mom": (spy_mom30, True)
+          }
 
-          # PMI >= 50 indicates expansion
-          try:
-              flags["PMI_good"] = (not pmi.empty and float(pmi.iloc[-1]) >= 50.0)
-          except:
-              flags["PMI_good"] = False
+          # GLD 전용
+          gld_vals = {
+              "GLD_RSI": (gld_rsi, True),       # RSI 높으면 매도
+              "GLD_shares": (None, False),      # ETF 보유량이 낮으면 매도 유력 (데이터 희박)
+              "CopperGold": (copper_gold_ratio, True),
+              "VIX": (vix, False)
+          }
 
-          # SPY 30-day momentum > 2%
-          try:
-              spy_mom30 = None
-              if not spy.empty and len(spy) >= 31:
-                  spy_mom30 = (spy.iloc[-1] / spy.iloc[-31] - 1) * 100
-                  flags["SPY_mom"] = (spy_mom30 >= 2.0)
-              else:
-                  flags["SPY_mom"] = False
-          except:
-              flags["SPY_mom"] = False
+          # TLT 전용
+          tlt_vals = {
+              "Real10_for_tlt": (real10, True),   # 실질금리 높을수록 TLT 약화
+              "FiveY5Y": (fred_latest("T5YIFR"), True),
+              "BondAuction": (None, True),
+              "LongRateMom": (longrate_mom10, True)
+          }
 
-          # -------------------------
-          # 총점 계산 (7개 지표)
-          indicator_list = ["VIX_low","HY_tight","Yield_steep","Unrate_improve","M2_pos","PMI_good","SPY_mom"]
-          total_points = sum(1 for k in indicator_list if flags.get(k, False))
+          # ---------- 점수 집계 ----------
+          total_possible = 0.0
+          gld_score = 0.0
+          tlt_score = 0.0
 
-          # -------------------------
-          # 자산별 영향지표 (각 4개씩)
-          # GLD 영향: VIX_low, HY_tight, PMI_good, SPY_mom
-          # TLT 영향: Yield_steep, M2_pos, PMI_good, SPY_mom
-          gld_indicators = ["VIX_low","HY_tight","PMI_good","SPY_mom"]
-          tlt_indicators = ["Yield_steep","M2_pos","PMI_good","SPY_mom"]
-          gld_points = sum(1 for k in gld_indicators if flags.get(k, False))
-          tlt_points = sum(1 for k in tlt_indicators if flags.get(k, False))
+          # common
+          for k,(val,dirflag) in common_vals.items():
+              w = common_w.get(k,8)
+              s = score_directional(val, dir_high=dirflag)
+              gld_score += s * w
+              tlt_score += s * w
+              total_possible += w
 
-          # -------------------------
-          # 분할매도 비율(A-1 기준)
-          def split_by_total(tp):
-              # tp: total_points (0-7)
-              if tp <= 2:
-                  return (0, 0)  # no sell
-              if 3 <= tp <= 4:
-                  return (0.30, 0.70)
-              if 5 <= tp <= 6:
-                  return (0.50, 0.50)
-              if tp >= 7:
-                  return (0.70, 0.30)
-              return (0,0)
+          # gld specific
+          for k,(val,dirflag) in gld_vals.items():
+              w = gld_w.get(k,7)
+              s = score_directional(val, dir_high=dirflag)
+              gld_score += s * w
+              total_possible += w
 
-          gld_split = split_by_total(total_points)
-          tlt_split = split_by_total(total_points)
+          # tlt specific
+          for k,(val,dirflag) in tlt_vals.items():
+              w = tlt_w.get(k,7)
+              s = score_directional(val, dir_high=dirflag)
+              tlt_score += s * w
+              total_possible += w
 
-          # -------------------------
-          # 매도 권고 판단: 총점 >=3 AND asset_points >=2
-          def decide_asset(name, asset_points, split):
-              if total_points >= 3 and asset_points >= 2:
-                  p1, p2 = split
-                  return True, p1, p2
-              return False, 0.0, 0.0
+          # 정규화 %
+          gld_pct = (gld_score / total_possible) * 100 if total_possible>0 else 0.0
+          tlt_pct = (tlt_score / total_possible) * 100 if total_possible>0 else 0.0
 
-          gld_sell, gld_p1, gld_p2 = decide_asset("GLD", gld_points, gld_split)
-          tlt_sell, tlt_p1, tlt_p2 = decide_asset("TLT", tlt_points, tlt_split)
+          log("Computed scores — GLD:", round(gld_pct,1), "%  TLT:", round(tlt_pct,1), "%")
 
-          # -------------------------
-          # 메시지 구성
+          # ---------- 권고 규칙 (A-1 매핑: 50/50 분할) ----------
+          def decide_by_pct(pct):
+              # returns (label, p1%, p2%)
+              if pct < 40:
+                  return ("유지", 0, 0)
+              if pct < 70:
+                  return ("1차매도", 50, 50)   # 사용자 요청: 분할 50/50
+              if pct < 90:
+                  return ("2차매도", 50, 50)
+              return ("강력매도", 50, 50)
+
+          gld_label, gld_p1, gld_p2 = decide_by_pct(gld_pct)
+          tlt_label, tlt_p1, tlt_p2 = decide_by_pct(tlt_pct)
+
+          # ---------- 트리거 목록(요약용) ----------
+          triggered_gld = []
+          triggered_tlt = []
+
+          # GLD triggers (샘플 기준)
+          if gld_rsi is not None and gld_rsi >= 70: triggered_gld.append(f"RSI {round(gld_rsi,1)}>=70")
+          if copper_gold_ratio is not None and copper_gold_ratio > 0.03: triggered_gld.append(f"Cu/Gold {round(copper_gold_ratio,4)}↑")
+          if vix is not None and vix <= 15: triggered_gld.append(f"VIX {round(vix,1)}<=15")
+          if pmi is not None and pmi >= 50: triggered_gld.append(f"PMI {round(pmi,1)}>=50")
+          if spy_mom30 is not None and spy_mom30 >= 2.0: triggered_gld.append(f"SPY_mom {round(spy_mom30,2)}%")
+
+          # TLT triggers
+          if longrate_mom10 is not None and longrate_mom10 > 0.1: triggered_tlt.append(f"10y mom {round(longrate_mom10,2)}%")
+          if yield_curve is not None and yield_curve >= 0.5: triggered_tlt.append(f"10y-2y {round(yield_curve,2)}%")
+          fivf = fred_latest("T5YIFR")
+          if fivf is not None and fivf >= 2.5: triggered_tlt.append(f"5y5y {round(fivf,2)}")
+          if real10 is not None and real10 >= 2.0: triggered_tlt.append(f"Real10 {round(real10,2)}%")
+          if hy_oas is not None and hy_oas <= 350: 
+              triggered_gld.append(f"HY {int(hy_oas)}bp"); triggered_tlt.append(f"HY {int(hy_oas)}bp")
+
+          # ---------- 상세형 메시지 구성 ----------
           lines = []
-          lines.append("📊 GLD/TLT 자동 권고 (점수형 A-1)")
+          lines.append("📋 GLD / TLT 상세 권고 리포트")
           lines.append(f"시각: {now}")
-          lines.append(f"총점: {total_points} / 7")
           lines.append("")
-          lines.append("지표 상태(핵심):")
-          for k in indicator_list:
-              v = flags.get(k, False)
-              lines.append(f"• {k}: {'Y' if v else 'N'}")
-          lines.append("")
-          # GLD 상세
-          lines.append(f"[GLD] 영향점수: {gld_points}/4")
-          if gld_sell:
-              lines.append(f"→ 권고: 매도 (분할 2회) 1차 {int(gld_p1*100)}% / 2차 {int(gld_p2*100)}%")
-          else:
-              lines.append("→ 권고: 보류 (매도 아님)")
-          # GLD 근거 상세
-          lines.append("GLD 근거:")
-          for k in gld_indicators:
-              lines.append(f"• {k}: {'Y' if flags.get(k, False) else 'N'}")
+          # GLD section
+          lines.append("=== GLD ===")
+          lines.append(f"최종점수: {round(gld_pct,1)}%  → 권고: {gld_label}  (분할 50/50 if sell)")
+          lines.append("지표값(주요):")
+          lines.append(f"• GLD 현재가: {gld.iloc[-1] if not gld.empty else 'NA'}  (RSI={round(gld_rsi,1) if gld_rsi is not None else 'NA'})")
+          lines.append(f"• VIX: {round(vix,1) if vix is not None else 'NA'}  • PMI: {round(pmi,1) if pmi is not None else 'NA'}")
+          lines.append(f"• Copper/Gold ratio: {round(copper_gold_ratio,4) if copper_gold_ratio is not None else 'NA'}")
+          lines.append("기여요인(간단):")
+          for k,(val,dirflag) in common_vals.items():
+              contrib = round(score_directional(val, dirflag) * common_w.get(k,8),2)
+              lines.append(f"  - {k}: val={val if val is not None else 'NA'} contrib={contrib}/{common_w.get(k,8)}")
+          for k,(val,dirflag) in gld_vals.items():
+              w = gld_w.get(k,7)
+              contrib = round(score_directional(val, dirflag) * w,2)
+              lines.append(f"  - {k}: val={val if val is not None else 'NA'} contrib={contrib}/{w}")
+          lines.append("트리거(요약): " + (", ".join(triggered_gld) if triggered_gld else "None"))
           lines.append("")
 
-          # TLT 상세
-          lines.append(f"[TLT] 영향점수: {tlt_points}/4")
-          if tlt_sell:
-              lines.append(f"→ 권고: 매도 (분할 2회) 1차 {int(tlt_p1*100)}% / 2차 {int(tlt_p2*100)}%")
-          else:
-              lines.append("→ 권고: 보류 (매도 아님)")
-          lines.append("TLT 근거:")
-          for k in tlt_indicators:
-              lines.append(f"• {k}: {'Y' if flags.get(k, False) else 'N'}")
-
-          # 현재 가격 정보
+          # TLT section
+          lines.append("=== TLT ===")
+          lines.append(f"최종점수: {round(tlt_pct,1)}%  → 권고: {tlt_label}  (분할 50/50 if sell)")
+          lines.append("지표값(주요):")
+          lines.append(f"• TLT 현재가: {tlt.iloc[-1] if not tlt.empty else 'NA'}  (10y mom={round(longrate_mom10,2) if longrate_mom10 is not None else 'NA'}%)")
+          lines.append(f"• 10y: {round(dgs10,2) if dgs10 is not None else 'NA'}  • 2y: {round(dgs2,2) if dgs2 is not None else 'NA'}  • 10y-2y: {round(yield_curve,2) if yield_curve is not None else 'NA'}")
+          lines.append(f"• Real10(근사): {round(real10,2) if real10 is not None else 'NA'}  • 5y5y: {round(fivf,2) if fivf is not None else 'NA'}")
+          lines.append("기여요인(간단):")
+          for k,(val,dirflag) in common_vals.items():
+              contrib = round(score_directional(val, dirflag) * common_w.get(k,8),2)
+              lines.append(f"  - {k}: val={val if val is not None else 'NA'} contrib={contrib}/{common_w.get(k,8)}")
+          for k,(val,dirflag) in tlt_vals.items():
+              w = tlt_w.get(k,7)
+              contrib = round(score_directional(val, dirflag) * w,2)
+              lines.append(f"  - {k}: val={val if val is not None else 'NA'} contrib={contrib}/{w}")
+          lines.append("트리거(요약): " + (", ".join(triggered_tlt) if triggered_tlt else "None"))
           lines.append("")
-          lines.append(f"GLD 가격: {gld.iloc[-1] if not gld.empty else 'NA'}")
-          lines.append(f"TLT 가격: {tlt.iloc[-1] if not tlt.empty else 'NA'}")
-          lines.append("")
-          lines.append("참고: 자동매매 아님. 이 알림은 권고이며 최종 의사결정은 사용자 필요.")
+          lines.append("참고: 권고는 자동매매 아님. 실제 매매는 사용자 판단 필수.")
 
           message = "\n".join(lines)
 
-          # -------------------------
-          # 텔레그램 전송 (조건: 한 자산이라도 sell 권고면 전송)
-          if gld_sell or tlt_sell:
+          # ---------- 전송 ----------
+          do_send = (gld_label != "유지") or (tlt_label != "유지")
+          if do_send:
               try:
                   url = f"https://api.telegram.org/bot{BOT}/sendMessage"
-                  r = requests.post(url, data={"chat_id": CHAT, "text": message}, timeout=15)
-                  eprint("Telegram status:", r.status_code)
+                  r = requests.post(url, data={"chat_id": CHAT, "text": message}, timeout=25)
+                  log("Telegram status:", r.status_code)
               except Exception as e:
-                  eprint("Telegram send error:", e)
+                  log("Telegram send error:", e)
           else:
-              eprint("조건 미충족: 알림 미전송. total_points, gld_points, tlt_points =", total_points, gld_points, tlt_points)
+              log("권고 없음 — 알림 미전송. Scores:", round(gld_pct,1), round(tlt_pct,1))
 
           PY
